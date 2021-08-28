@@ -1,4 +1,5 @@
-﻿using Sandbox.Definitions;
+﻿using PulseOreDetector.Proto;
+using Sandbox.Definitions;
 using Sandbox.Game;
 using Sandbox.Game.Entities;
 using Sandbox.ModAPI;
@@ -7,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using VRage;
 using VRage.Game;
 using VRage.Game.Components;
 using VRage.Game.ModAPI;
@@ -21,17 +23,11 @@ namespace PulseOreDetector
     [MyEntityComponentDescriptor(typeof(MyObjectBuilder_TerminalBlock), false, "LargePulseDetector" , "SmallPulseDetector" )]
     class PulseOreDetector : MyGameLogicComponent
     {
-        private static int CoolDown = 15;
-        private static float Range = 2000;
-        private static int Resolution = 3;
-        private static int BatchDistance = 200;
-        private static int MinHits = 2;
-
         private IMyTerminalBlock Block;
         private DateTime NextPulse;
-        private bool IsScanning;
-        private int VoxelIndex;
-        private double VoxelProgress;
+
+        IEnumerator<string> ScanRun;
+        string CurrentScanStatus = "Idle";
 
         public override void Init(MyObjectBuilder_EntityBase objectBuilder)
         {
@@ -45,8 +41,6 @@ namespace PulseOreDetector
                 NextPulse = DateTime.Now;
                 SetupTerminalControls<IMyTerminalBlock>();
                 NeedsUpdate = MyEntityUpdateEnum.EACH_100TH_FRAME;
-                Entity.NeedsUpdate = MyEntityUpdateEnum.EACH_100TH_FRAME;
-                // TODO update info
 
                 Block = (IMyTerminalBlock)Entity;
                 Block.AppendingCustomInfo += AppendInfo;
@@ -57,15 +51,20 @@ namespace PulseOreDetector
             }
         }
 
+        private bool IsScanning { get { return ScanRun != null;  } }
+
         private void AppendInfo(IMyTerminalBlock block, StringBuilder sb)
         {
             var logic = GetLogic(block);
             if (logic == null) return;
 
             var diffInSeconds = (int)(NextPulse - DateTime.Now).TotalSeconds;
-            if(diffInSeconds <= 0)
+            if(IsScanning)
             {
-                sb.Append("Detector Ready!\n");
+                sb.AppendLine(CurrentScanStatus);
+            } else if(diffInSeconds <= 0)
+            {
+                sb.AppendLine("Idle");
             } else
             {
                 sb.AppendFormat("Detector on Cooldown: {0}\n", diffInSeconds);
@@ -75,28 +74,46 @@ namespace PulseOreDetector
         public override void UpdateBeforeSimulation100()
         {
             base.UpdateBeforeSimulation100();
+
+            if (ScanRun != null)
+            {
+                NeedsUpdate = MyEntityUpdateEnum.EACH_FRAME;
+                return;
+            }
             PulseOreDetectorMod.Instance.ScanButton.UpdateVisual();
             Block.RefreshCustomInfo();
-            RefreshControls(Block);
+            Utilities.RefreshControls(Block);
         }
 
-        public static void RefreshControls(IMyTerminalBlock block)
+        public override void UpdateBeforeSimulation()
         {
-
-            if (MyAPIGateway.Gui.GetCurrentScreen == MyTerminalPageEnum.ControlPanel)
+            base.UpdateBeforeSimulation();
+            if(ScanRun == null)
             {
-                var myCubeBlock = block as MyCubeBlock;
-
-                if (myCubeBlock.IDModule != null)
+                NeedsUpdate = MyEntityUpdateEnum.EACH_100TH_FRAME;
+                return;
+            } else
+            {
+                bool next = false;
+                try
                 {
-
-                    var share = myCubeBlock.IDModule.ShareMode;
-                    var owner = myCubeBlock.IDModule.Owner;
-                    myCubeBlock.ChangeOwner(owner, share == MyOwnershipShareModeEnum.None ? MyOwnershipShareModeEnum.All : MyOwnershipShareModeEnum.None);
-                    myCubeBlock.ChangeOwner(owner, share);
+                    next = ScanRun.MoveNext();
+                } catch (Exception e)
+                {
+                    MyLog.Default.WriteLine("PulseOreDetector Error while Scanning " + e.ToString());
                 }
+                if(!next || ScanRun.Current == null)
+                {
+                    ScanRun = null;
+                } else
+                {
+                    CurrentScanStatus = ScanRun.Current;
+                }
+                Block.RefreshCustomInfo();
+                Utilities.RefreshControls(Block);
             }
         }
+
 
         static void SetupTerminalControls<T>()
         {
@@ -129,16 +146,17 @@ namespace PulseOreDetector
         static bool CooldownDone(PulseOreDetector logic)
         {
             if (logic == null) return false;
-            return DateTime.Now > logic.NextPulse;
+            return !logic.IsScanning && DateTime.Now > logic.NextPulse;
         }
 
         static bool Control_Visible(IMyTerminalBlock block)
         {
-            return GetLogic(block) != null;
+            return Config.Instance != null && GetLogic(block) != null;
         }
 
         static bool Control_Enabled(IMyTerminalBlock block)
         {
+            if (Config.Instance == null) return false;
             var logic = GetLogic(block);
             if (logic == null) return false;
             return CooldownDone(logic);
@@ -156,62 +174,97 @@ namespace PulseOreDetector
 
                 return;
             }
-            ScanForOres(logic);
-
-            
+            logic.ScanRun = ScanForOres(logic);
         }
 
-        static void ScanForOres(PulseOreDetector logic)
+        static IEnumerator<string> ScanForOres(PulseOreDetector logic)
         {
-            if (logic == null) return;
-            logic.NextPulse = DateTime.Now.AddSeconds(CoolDown);
-            logic.IsScanning = true;
             PulseOreDetectorMod.Instance.ScanButton.UpdateVisual();
 
             var currentAsteroidList = new List<IMyVoxelBase>();
             var position = logic.Block.GetPosition();
 
-            MyAPIGateway.Session.VoxelMaps.GetInstances(currentAsteroidList, v => Math.Sqrt((position - v.PositionLeftBottomCorner).LengthSquared()) < Math.Sqrt(Math.Pow(v.Storage.Size.X, 2) * 3) + Range + 500f);
-
+            MyAPIGateway.Session.VoxelMaps.GetInstances(currentAsteroidList, v => Math.Sqrt((position - v.PositionLeftBottomCorner).LengthSquared()) < Math.Sqrt(Math.Pow(v.Storage.Size.X, 2) * 3) + Config.Instance.MaxRange + 500f);
+            yield return "Got Material Information";
 
             List<ScanHit> scanHits = new List<ScanHit>();
 
+            bool overload = false;
+            int voxel = 0;
             foreach (var voxelMap in currentAsteroidList)
             {
-                FindMaterial(voxelMap, position, scanHits);
+                voxel++;
+                yield return "Starting Scan " + voxel + " / " + currentAsteroidList.Count;
+
+                IEnumerator<Progress> currentScan = FindMaterial(voxelMap, position, scanHits);
+
+                while (true)
+                {
+                    bool next = false;
+                    try
+                    {
+                        next = currentScan.MoveNext();
+                        if (!next || currentScan.Current == null) break;
+                    } catch (Exception e)
+                    {
+                        overload = true;
+                        break;
+                    }
+                    float percent = (float)currentScan.Current.Current / currentScan.Current.Total * 100f;
+                    string result = "Scan " + voxel + " / " + currentAsteroidList.Count + " -> " + percent.ToString("0.00") + "%" + "\n" + currentScan.Current.Current + " / " + currentScan.Current.Total;
+                    if(overload)
+                    {
+                        result += "\nSENSORY OVERLOAD! Too much Input.";
+                    }
+                    yield return result;
+                }
             }
 
+            yield return "Scan complete. Analyzing Data.";
+
             var findMaterial = PulseOreDetectorMod.VoxelMaterials.Select(f => f.Index).ToArray();
+            int current = 0;
+            int hits = 0;
             foreach (ScanHit scanHit in scanHits)
             {
-                if (MinHits > scanHit.Hits) continue;
-                var index = Array.IndexOf(findMaterial, scanHit.Material);
-                var name = PulseOreDetectorMod.VoxelMaterials[index].MinedOre;
-                MyAPIGateway.Session.GPS.AddGps(MyAPIGateway.Session.Player.IdentityId, MyAPIGateway.Session.GPS.Create("POD " + name + " (" + scanHit.Hits + " Pings)", "Pulse Ore Scanner", scanHit.Position, true, true));
+                current++;
+                MySize size = Config.Instance.SizeDescriptions.FindLast(sd => sd.MinSize <= scanHit.Hits);
+                if (size != null)
+                {
+                    hits++;
+                    var index = Array.IndexOf(findMaterial, scanHit.Material);
+                    var name = PulseOreDetectorMod.VoxelMaterials[index].MinedOre;
+                    MyAlias alias = Config.Instance.OreNames.Find(on => on.Input.Equals(name));
+                    name = alias != null ? alias.Output : name;
+                    string gps = string.Format(Config.Instance.GPSFormat, name, size.Name);
+                    MyAPIGateway.Session.GPS.AddGps(MyAPIGateway.Session.Player.IdentityId, MyAPIGateway.Session.GPS.Create(gps, "Pulse Ore Scanner", scanHit.Position, true, true));
+                }
+                yield return "Adding GPS Markes " + current + " / " + scanHits.Count;
             }
-            logic.IsScanning = false; 
-
-            Utilities.ShowNotificationLocal(string.Format("[{0}] ore deposits found on [{1}] asteroids within [{2}m] range.", scanHits.Count, currentAsteroidList.Count, Range));
+            yield return "Added GPS Points for relevant Spots";
+            logic.NextPulse = DateTime.Now.AddSeconds(Config.Instance.CooldownSeconds);
+            Utilities.ShowNotificationLocal(string.Format("[{0}] ore deposits found on [{1}] asteroids within [{2}m] range.", hits, currentAsteroidList.Count, Config.Instance.MaxRange));
         }
 
-        private static void FindMaterial(IMyVoxelBase voxelMap, Vector3D center, List<ScanHit> scanHits)
+        private static IEnumerator<Progress> FindMaterial(IMyVoxelBase voxelMap, Vector3D center, List<ScanHit> scanHits)
         {
-            double checkDistance = BatchDistance * BatchDistance; 
+            var progress = new Progress(); ;
+            double checkDistance = Config.Instance.BatchDistance * Config.Instance.BatchDistance; 
             var findMaterial = PulseOreDetectorMod.VoxelMaterials.Select(f => f.Index).ToArray();
             var storage = voxelMap.Storage;
-            var scale = (int)Math.Pow(2, Resolution);
+            var scale = (int)Math.Pow(2, Config.Instance.Resolution);
 
             var point = new Vector3I(center - voxelMap.PositionLeftBottomCorner);
 
-            var min = ((point - (int)Range) / 64) * 64;
+            var min = ((point - (int)Config.Instance.SafeMaxRange) / 64) * 64;
             min = Vector3I.Max(min, Vector3I.Zero);
 
-            var max = ((point + (int)Range) / 64) * 64;
+            var max = ((point + (int)Config.Instance.SafeMaxRange) / 64) * 64;
             max = Vector3I.Max(max, min + 64);
 
             if (min.X >= storage.Size.X || min.Y >= storage.Size.Y || min.Z >= storage.Size.Z)
             {
-                return;
+                yield return null;
             }
 
             var oldCache = new MyStorageData();
@@ -219,10 +272,15 @@ namespace PulseOreDetector
             var smax = (max / scale) - 1;
             var smin = (min / scale);
             var size = smax - smin + 1;
+
+            progress.Total = (long)size.X * (long)size.Y * (long)size.Z;
+            yield return progress;
+
             oldCache.Resize(size);
-            storage.ReadRange(oldCache, MyStorageDataTypeFlags.ContentAndMaterial, Resolution, smin, smax);
+            storage.ReadRange(oldCache, MyStorageDataTypeFlags.ContentAndMaterial, Config.Instance.Resolution, smin, smax);
+            yield return progress;
 
-
+            int step = 0;
             Vector3I p;
             for (p.Z = 0; p.Z < size.Z; ++p.Z)
                 for (p.Y = 0; p.Y < size.Y; ++p.Y)
@@ -231,7 +289,7 @@ namespace PulseOreDetector
                         // place GPS near the center of the Voxel
                         Vector3D position = voxelMap.PositionLeftBottomCorner + (p * scale) + (scale / 2f) + min;
 
-                        if (Math.Sqrt((position - center).LengthSquared()) < Range)
+                        if (Math.Sqrt((position - center).LengthSquared()) < Config.Instance.SafeMaxRange)
                         {
                             byte content = oldCache.Content(ref p);
                             byte material = oldCache.Material(ref p);
@@ -252,6 +310,12 @@ namespace PulseOreDetector
                                     scanHits.Add(new ScanHit(position, material));
                             }
                         }
+                        progress.Current++;
+                        if (step++ >= Config.Instance.MaxChecksPerTick)
+                        {
+                            step = 0;
+                            yield return progress;
+                        }
                     }
         }
 
@@ -268,5 +332,13 @@ namespace PulseOreDetector
                 Hits = 1;
             }
         }
+
+        protected class Progress
+        {
+            public long Current = 0;
+            public long Total = 0;
+            public bool Overload = false;
+        }
+
     }
 }
